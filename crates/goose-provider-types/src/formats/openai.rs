@@ -1264,6 +1264,70 @@ fn output_token_limit_marker(id: Option<String>) -> Message {
     message
 }
 
+/// Merges one streamed `tool_calls[]` delta into the accumulator.
+///
+/// Providers disagree on what a continuation delta carries. An explicit `index`
+/// is authoritative. Without one, a delta belongs to the call whose `id` it
+/// repeats, a previously unseen `id` opens the next call, and a delta carrying
+/// neither continues the call opened most recently -- which is where the
+/// single-delta continuation chunks of providers that omit `index` land.
+/// Resolving those by position in the chunk would instead attach every one of
+/// them to call 0.
+///
+/// A call is only created once a delta supplies both an `id` and a `name`, so
+/// an argument fragment that arrives before either is appended to a call
+/// already open or dropped, never emitted as a nameless call.
+fn merge_tool_call_delta(
+    tool_call_data: &mut ToolCallData,
+    last_opened: &mut Option<i32>,
+    position: usize,
+    delta: &DeltaToolCall,
+) {
+    let index = match delta.index {
+        Some(index) => index,
+        None => match delta.id.as_deref().filter(|id| !id.is_empty()) {
+            Some(id) => tool_call_data
+                .iter()
+                .find(|(_, call)| call.0 == id)
+                .map(|(index, _)| *index)
+                .unwrap_or_else(|| {
+                    tool_call_data
+                        .keys()
+                        .max()
+                        .map_or(position as i32, |max| max + 1)
+                }),
+            None => last_opened.unwrap_or(position as i32),
+        },
+    };
+
+    if let Some((_, stored_name, args, extra)) = tool_call_data.get_mut(&index) {
+        if let Some(new_name) = &delta.function.name {
+            if !new_name.is_empty() {
+                *stored_name = new_name.clone();
+            }
+        }
+        args.push_str(&delta.function.arguments);
+        if extra.is_none() && delta.extra.is_some() {
+            *extra = delta.extra.clone();
+        } else if let (Some(existing), Some(new_extra)) = (extra.as_mut(), &delta.extra) {
+            for (key, value) in new_extra {
+                existing.entry(key.clone()).or_insert(value.clone());
+            }
+        }
+    } else if let (Some(id), Some(name)) = (&delta.id, &delta.function.name) {
+        tool_call_data.insert(
+            index,
+            (
+                id.clone(),
+                name.clone(),
+                delta.function.arguments.clone(),
+                delta.extra.clone(),
+            ),
+        );
+        *last_opened = Some(index);
+    }
+}
+
 pub fn response_to_streaming_message<S>(
     mut stream: S,
 ) -> impl Stream<Item = anyhow::Result<(Option<Message>, Option<ProviderUsage>)>> + 'static
@@ -1346,13 +1410,16 @@ where
                 yield (None, usage)
             } else if chunk.choices[0].delta.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty()) {
                 let mut tool_call_data: ToolCallData = HashMap::new();
+                let mut last_opened_tool_call: Option<i32> = None;
 
                 if let Some(tool_calls) = &chunk.choices[0].delta.tool_calls {
                     for (position, tool_call) in tool_calls.iter().enumerate() {
-                        if let (Some(id), Some(name)) = (&tool_call.id, &tool_call.function.name) {
-                            let index = tool_call.index.unwrap_or(position as i32);
-                            tool_call_data.insert(index, (id.clone(), name.clone(), tool_call.function.arguments.clone(), tool_call.extra.clone()));
-                        }
+                        merge_tool_call_delta(
+                            &mut tool_call_data,
+                            &mut last_opened_tool_call,
+                            position,
+                            tool_call,
+                        );
                     }
                 }
 
@@ -1413,26 +1480,13 @@ where
                                         }
                                     }
                                     if let Some(delta_tool_calls) = &tool_chunk.choices[0].delta.tool_calls {
-                                        for delta_call in delta_tool_calls {
-                                            if let Some(index) = delta_call.index {
-                                                if let Some((_, ref mut stored_name, ref mut args, ref mut extra)) = tool_call_data.get_mut(&index) {
-                                                    if let Some(new_name) = &delta_call.function.name {
-                                                        if !new_name.is_empty() {
-                                                            *stored_name = new_name.clone();
-                                                        }
-                                                    }
-                                                    args.push_str(&delta_call.function.arguments);
-                                                    if extra.is_none() && delta_call.extra.is_some() {
-                                                        *extra = delta_call.extra.clone();
-                                                    } else if let (Some(existing), Some(new_extra)) = (extra.as_mut(), &delta_call.extra) {
-                                                        for (key, value) in new_extra {
-                                                            existing.entry(key.clone()).or_insert(value.clone());
-                                                        }
-                                                    }
-                                                } else if let (Some(id), Some(name)) = (&delta_call.id, &delta_call.function.name) {
-                                                    tool_call_data.insert(index, (id.clone(), name.clone(), delta_call.function.arguments.clone(), delta_call.extra.clone()));
-                                                }
-                                            }
+                                        for (position, delta_call) in delta_tool_calls.iter().enumerate() {
+                                            merge_tool_call_delta(
+                                                &mut tool_call_data,
+                                                &mut last_opened_tool_call,
+                                                position,
+                                                delta_call,
+                                            );
                                         }
                                     }
                                     if tool_chunk.choices[0].finish_reason.is_some() {
@@ -3760,6 +3814,74 @@ mod tests {
             write.arguments.as_ref().unwrap()["path"],
             json!("/tmp/a.md")
         );
+    }
+
+    /// Kimi-style streams open a call with one delta carrying `id`/`name` and
+    /// put the first argument fragment in a second delta for the same `index`.
+    #[tokio::test]
+    async fn test_streaming_accumulates_same_index_fragment_from_opening_chunk() {
+        let response_lines = concat!(
+            r#"data: {"id":"chatcmpl-kimi","model":"test-model","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"functions.tree:0","type":"function","function":{"name":"tree"}},{"index":0,"function":{"arguments":" {\""}}]},"finish_reason":null}]}"#,
+            "\n",
+            r#"data: {"id":"chatcmpl-kimi","model":"test-model","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"path\": \".\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            "\n",
+            "data: [DONE]",
+        );
+
+        let requests = collect_streamed_tool_requests(response_lines).await;
+
+        assert_eq!(requests.len(), 1);
+        let tree = requests[0].tool_call.as_ref().expect("tree args parsed");
+        assert_eq!(tree.name, "tree");
+        assert_eq!(tree.arguments.as_ref().unwrap()["path"], json!("."));
+    }
+
+    /// Providers that omit `tool_calls[].index` send the rest of the arguments
+    /// in a delta that identifies no call at all.
+    #[tokio::test]
+    async fn test_streaming_accumulates_continuation_without_index() {
+        let response_lines = concat!(
+            r#"data: {"id":"chatcmpl-noidx","model":"test-model","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"id":"call_a","type":"function","function":{"name":"get_weather","arguments":"{\"city\": "}}]},"finish_reason":null}]}"#,
+            "\n",
+            r#"data: {"id":"chatcmpl-noidx","model":"test-model","choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"\"Paris\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            "\n",
+            "data: [DONE]",
+        );
+
+        let requests = collect_streamed_tool_requests(response_lines).await;
+
+        assert_eq!(requests.len(), 1);
+        let weather = requests[0].tool_call.as_ref().expect("weather args parsed");
+        assert_eq!(weather.name, "get_weather");
+        assert_eq!(weather.arguments.as_ref().unwrap()["city"], json!("Paris"));
+    }
+
+    /// Without an `index`, a previously unseen `id` opens the next call and the
+    /// fragments that follow it belong to that call, not to the first one.
+    #[tokio::test]
+    async fn test_streaming_separates_two_sequential_calls_without_index() {
+        let response_lines = concat!(
+            r#"data: {"id":"chatcmpl-seq","model":"test-model","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"id":"call_a","type":"function","function":{"name":"first","arguments":"{\"a\": "}}]},"finish_reason":null}]}"#,
+            "\n",
+            r#"data: {"id":"chatcmpl-seq","model":"test-model","choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"1}"}}]},"finish_reason":null}]}"#,
+            "\n",
+            r#"data: {"id":"chatcmpl-seq","model":"test-model","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_b","type":"function","function":{"name":"second","arguments":"{\"b\": "}}]},"finish_reason":null}]}"#,
+            "\n",
+            r#"data: {"id":"chatcmpl-seq","model":"test-model","choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"2}"}}]},"finish_reason":"tool_calls"}]}"#,
+            "\n",
+            "data: [DONE]",
+        );
+
+        let requests = collect_streamed_tool_requests(response_lines).await;
+
+        assert_eq!(requests.len(), 2);
+        let first = requests[0].tool_call.as_ref().expect("first args parsed");
+        assert_eq!(first.name, "first");
+        assert_eq!(first.arguments.as_ref().unwrap()["a"], json!(1));
+
+        let second = requests[1].tool_call.as_ref().expect("second args parsed");
+        assert_eq!(second.name, "second");
+        assert_eq!(second.arguments.as_ref().unwrap()["b"], json!(2));
     }
 
     #[tokio::test]
